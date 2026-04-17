@@ -110,6 +110,193 @@ def send_serverchan_markdown(*, title: str, desp: str, push_key: str, timeout: i
         raise RuntimeError(f"Server酱返回错误：{err}")
 
 
+def notify_failure(*, step: str, error: str, push_key: str | None = None) -> None:
+    """当 CI 任何步骤失败时推送简短告警。"""
+    key = push_key or (os.environ.get("PUSH_KEY") or "").strip()
+    if not key:
+        logger.info("未设置 PUSH_KEY，跳过失败告警推送。")
+        return
+    title = f"A股选股 CI 失败｜{step}"
+    desp = f"## 运行失败\n\n- **步骤**：{step}\n- **错误**：{error}\n"
+    try:
+        send_serverchan_markdown(title=title, desp=desp, push_key=key)
+        logger.info("失败告警已推送：%s", title)
+    except Exception:
+        logger.exception("失败告警推送异常")
+
+
+def _build_run2_markdown(df: pd.DataFrame) -> str:
+    """将 run2.py 输出的 DataFrame 转为 Markdown（空时返回空串）。"""
+    if df is None or df.empty:
+        return ""
+
+    want = [
+        ("市盈率-动态",        "PE（动态）"),
+        ("最新价",             "最新价"),
+        ("销售毛利率_pct",     "毛利率（%）"),
+        ("OCF_NP比",          "经营现金流/净利润"),
+        ("股息率_pct",        "股息率（%）"),
+        ("三年平均分红率_pct", "近三年平均分红率（%）"),
+        ("分红达标说明",       "分红达标"),
+    ]
+
+    lines: list[str] = ["## 深度价值池 v2（无回撤条件）", ""]
+    for n, (_, row) in enumerate(df.iterrows(), start=1):
+        code = row.get("代码", "")
+        name = row.get("名称", "")
+        lines.append(f"### {n}. {code} {name}")
+        lines.append("")
+        for col, label in want:
+            if col not in df.columns:
+                continue
+            val = row.get(col)
+            if col in ("市盈率-动态", "最新价", "销售毛利率_pct",
+                        "OCF_NP比", "股息率_pct", "三年平均分红率_pct"):
+                lines.append(f"- **{label}**：{_fmt_num(val, ndigits=3)}")
+            else:
+                text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val).strip()
+                lines.append(f"- **{label}**：{text or '—'}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def notify_run2_pool(csv_path: Path | str) -> None:
+    """
+    读取 run2.py 生成的 CSV，若有 ``PUSH_KEY`` 则推送摘要。
+    """
+    path = Path(csv_path).resolve()
+    if not path.exists():
+        logger.warning("推送跳过：CSV 不存在：%s", path)
+        return
+
+    push_key = (os.environ.get("PUSH_KEY") or "").strip()
+    if not push_key:
+        logger.info("未设置环境变量 PUSH_KEY，跳过 Server酱推送。")
+        return
+
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    title_date = path.stem.replace("2deep_value_pool_", "")
+    title = f"A股深度价值 v2｜{title_date}"
+
+    if df.empty:
+        desp = EMPTY_POOL_MESSAGE
+    else:
+        desp = _build_run2_markdown(df)
+        if not desp.strip():
+            desp = EMPTY_POOL_MESSAGE
+
+    try:
+        send_serverchan_markdown(title=title, desp=desp, push_key=push_key)
+        logger.info("Server酱推送成功：%s", title)
+    except Exception:
+        logger.exception("Server酱推送失败")
+
+
+def _build_tcg_markdown(data: dict) -> str:
+    """将 analyze_tcg.py 输出的 JSON dict 转为 Markdown。"""
+    q  = data.get("quote",   {})
+    st = data.get("stats",   {})
+    fl = data.get("flows",   [])
+    sg = data.get("signals", [])
+    date = data.get("date", "")
+    name = data.get("name", "")
+    code = data.get("code", "")
+
+    def _v(val, suffix="", ndigits=2):
+        if val is None:
+            return "—"
+        return f"{round(float(val), ndigits)}{suffix}"
+
+    lines: list[str] = [f"## {name}（{code}）每日快报  {date}", ""]
+
+    # ── 行情 ──────────────────────────────────────────────────────
+    lines += ["### 今日行情", ""]
+    chg = q.get("change_pct")
+    chg_str = f"{chg:+.2f}%" if chg is not None else "—"
+    lines.append(f"| 指标 | 数值 |")
+    lines.append(f"|------|------|")
+    lines.append(f"| 收盘价 | **{_v(q.get('price'), '元')}** （{chg_str}） |")
+    lines.append(f"| 换手率 | {_v(q.get('turnover_pct'), '%')} |")
+    lines.append(f"| 振幅 | {_v(q.get('amplitude_pct'), '%')} |")
+    lines.append(f"| 量比 | {_v(q.get('volume_ratio'))} |")
+    lines.append(f"| 动态PE | {_v(q.get('pe_ttm'), '倍')} |")
+    lines.append(f"| 60日涨跌 | {_v(q.get('d60_chg'), '%')} |")
+    lines.append(f"| 年初至今 | {_v(q.get('ytd_chg'), '%')} |")
+    lines.append("")
+
+    # ── 均线 ──────────────────────────────────────────────────────
+    mas = st.get("ma", {})
+    if mas:
+        lines += ["### 均线偏离", ""]
+        lines.append("| 均线 | 均值 | 偏离幅度 |")
+        lines.append("|------|------|----------|")
+        for label in ("MA5", "MA10", "MA20", "MA60"):
+            m = mas.get(label, {})
+            val = m.get("value")
+            dev = m.get("dev_pct")
+            dev_str = f"{dev:+.2f}%" if dev is not None else "—"
+            lines.append(f"| {label} | {_v(val, '元')} | {dev_str} |")
+        bull = st.get("bull_aligned")
+        if bull is True:
+            lines.append("\n> 多头排列，趋势向上")
+        elif bull is False:
+            lines.append("\n> 空头排列，趋势偏弱")
+        lines.append("")
+
+    # ── 资金流向 ──────────────────────────────────────────────────
+    if fl:
+        lines += ["### 近 5 日主力资金流向", ""]
+        lines.append("| 日期 | 收盘 | 涨跌 | 主力净流入（万） |")
+        lines.append("|------|------|------|----------------|")
+        for row in fl:
+            mnet = row.get("major_net")
+            mnet_str = f"{mnet/10000:+.0f}" if mnet is not None else "—"
+            lines.append(
+                f"| {row.get('date','')} "
+                f"| {_v(row.get('close'), '元')} "
+                f"| {_v(row.get('change_pct'), '%')} "
+                f"| {mnet_str} |"
+            )
+        lines.append("")
+
+    # ── 信号 ──────────────────────────────────────────────────────
+    if sg:
+        lines += ["### 量化信号", ""]
+        for s in sg:
+            lines.append(f"- {s}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def notify_tcg_daily(json_path: "Path | str") -> None:
+    """
+    读取 analyze_tcg.py 生成的 JSON 日报，若有 ``PUSH_KEY`` 则推送每日快报。
+    """
+    import json as _json
+
+    path = Path(json_path).resolve()
+    if not path.exists():
+        logger.warning("推送跳过：JSON 不存在：%s", path)
+        return
+
+    push_key = (os.environ.get("PUSH_KEY") or "").strip()
+    if not push_key:
+        logger.info("未设置环境变量 PUSH_KEY，跳过 Server酱推送。")
+        return
+
+    data  = _json.loads(path.read_text(encoding="utf-8"))
+    date  = data.get("date", path.stem.replace("tcg_daily_", ""))
+    title = f"太辰光(300570) 日报｜{date}"
+    desp  = _build_tcg_markdown(data)
+
+    try:
+        send_serverchan_markdown(title=title, desp=desp, push_key=push_key)
+        logger.info("Server酱推送成功：%s", title)
+    except Exception:
+        logger.exception("Server酱推送失败")
+
+
 def notify_deep_value_pool(csv_path: Path | str) -> None:
     """
     读取最终池 CSV，若有 ``PUSH_KEY`` 则推送摘要。
