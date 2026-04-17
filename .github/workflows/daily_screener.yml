@@ -1,0 +1,82 @@
+name: Daily A-share screener
+
+on:
+  workflow_dispatch:        # 支持手动触发
+  schedule:
+    # 北京时间周一至周五 15:30（收盘后 30 分钟）= UTC 07:30
+    - cron: "30 7 * * 1-5"
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    env:
+      PUSH_KEY: ${{ secrets.PUSH_KEY }}
+
+    steps:
+      # ── 1. 检出代码 ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. 配置 Python ───────────────────────────────────────────
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      # ── 3. 安装依赖 ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. 深度价值漏斗 v1（含 K 线回撤，推送结果） ──────────────
+      - name: Run deep value funnel v1
+        id: funnel_v1
+        run: python run_deep_value_funnel.py
+
+      # ── 5. 深度价值漏斗 v2（无回撤条件，推送结果） ───────────────
+      - name: Run deep value screener v2
+        id: screener_v2
+        run: python run2.py
+
+      # ── 6. 太辰光每日快报（行情 + 均线 + 资金流 + 信号） ─────────
+      - name: Analyze 太辰光 (300570)
+        id: tcg_analysis
+        run: python analyze_tcg.py --output-dir .
+
+      # ── 7. 上传所有产物（无论成功与否） ──────────────────────────
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screening-results-${{ github.run_id }}
+          retention-days: 14
+          path: |
+            step1_basic_pool.csv
+            step2_finance_pool.csv
+            deep_value_pool_*.csv
+            2deep_value_pool_*.csv
+            tcg_daily_*.json
+          if-no-files-found: warn
+
+      # ── 8. 失败时推送微信告警 ────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        env:
+          PUSH_KEY: ${{ secrets.PUSH_KEY }}
+          FAILED_STEPS: >-
+            ${{ (steps.funnel_v1.outcome    == 'failure' && 'funnel_v1 ')    || '' }}${{
+                (steps.screener_v2.outcome  == 'failure' && 'screener_v2 ')  || '' }}${{
+                (steps.tcg_analysis.outcome == 'failure' && 'tcg_analysis')  || '' }}
+        run: |
+          python - <<'EOF'
+          import os
+          from notifier import notify_failure
+          steps   = os.environ.get("FAILED_STEPS", "unknown").strip() or "unknown"
+          run_url = (
+              "https://github.com/${{ github.repository }}"
+              "/actions/runs/${{ github.run_id }}"
+          )
+          notify_failure(step=steps, error=f"查看日志：{run_url}")
+          EOF
