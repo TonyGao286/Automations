@@ -11,17 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PUSH_KEY: ${{ secrets.PUSH_KEY }}
-      # 提前迁移到 Node.js 24，避免 Node 20 弃用警告（2026-06-02 起强制切换）
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       # ── 1. 检出代码 ─────────────────────────────────────────────
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ── 2. 配置 Python ───────────────────────────────────────────
       - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: pip
@@ -50,7 +48,7 @@ jobs:
       # ── 7. 上传所有产物（无论成功与否） ──────────────────────────
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: screening-results-${{ github.run_id }}
           retention-days: 14
