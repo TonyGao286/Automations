@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PUSH_KEY: ${{ secrets.PUSH_KEY }}
+      # 提前迁移到 Node.js 24，避免 Node 20 弃用警告（2026-06-02 起强制切换）
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       # ── 1. 检出代码 ─────────────────────────────────────────────
