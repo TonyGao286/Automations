@@ -201,11 +201,80 @@ def fetch_quote(code: str) -> dict:
     logger.warning("[quote] 东财源失败，尝试新浪兜底源 ...")
     quote = _quote_from_sina(code)
     if quote:
+        # 非东财补源：尽量补齐量比 / 动态PE 等字段（新浪分钟线通常没有）
+        extra = _quote_extra_from_tencent(code)
+        if extra:
+            for k, v in extra.items():
+                if quote.get(k) is None and v is not None:
+                    quote[k] = v
         logger.info("[quote] 已从新浪兜底获取（字段少于东财）")
         return quote
 
     raise RuntimeError("东财和新浪两个行情源均失败")
 
+
+def _quote_extra_from_tencent(code: str) -> dict | None:
+    """
+    额外行情补源（非东财）：腾讯行情 `qt.gtimg.cn`。
+
+    用途：当主源/兜底源缺失时，尽量补齐：
+    - volume_ratio（量比）
+    - pe_ttm（动态 PE，腾讯口径通常接近 TTM）
+    - pb（市净率，顺带补）
+    - turnover_pct（换手率，顺带补）
+    - amplitude_pct（振幅，顺带补）
+
+    说明：该接口为轻量文本协议，字段位置可能调整；这里采用“按索引取值 + 容错”策略。
+    """
+    symbol = f"sh{code}" if code.startswith("6") else f"sz{code}"
+    url = f"https://qt.gtimg.cn/q={symbol}"
+
+    def _fetch_text() -> str | None:
+        try:
+            resp = _requests.get(url, timeout=15)
+            if resp.status_code != 200:
+                return None
+            return (resp.text or "").strip()
+        except Exception:
+            return None
+
+    txt = _safe(_fetch_text, default=None, retries=1, delay=2.0)
+    if not txt or "~" not in txt or "=" not in txt:
+        return None
+
+    try:
+        body = txt.split("=", 1)[1].strip()
+        if body.startswith('"'):
+            body = body[1:]
+        if body.endswith('";'):
+            body = body[:-2]
+        elif body.endswith(";"):
+            body = body[:-1]
+        parts = body.split("~")
+    except Exception:
+        return None
+
+    # 索引参考（实测 sz300570 返回 88 段）：
+    # 38 换手率、43 振幅、49 量比、62 动态PE、63 PB
+    def _get_f(idx: int) -> float | None:
+        try:
+            return _pct(parts[idx])
+        except Exception:
+            return None
+
+    extra = {
+        "turnover_pct":  _get_f(38),
+        "amplitude_pct": _get_f(43),
+        "volume_ratio":  _get_f(49),
+        "pe_ttm":        _get_f(62),
+        "pb":            _get_f(63),
+        "_source_extra": "tencent",
+    }
+
+    # 若核心字段都取不到，就视为不可用
+    if extra["volume_ratio"] is None and extra["pe_ttm"] is None:
+        return None
+    return extra
 
 def _kline_from_em(code: str) -> list[dict] | None:
     """主源：东方财富日线（带前复权和振幅字段）。"""
@@ -544,8 +613,12 @@ def analyze_from_raw(raw: dict) -> dict:
     """
     logger.info("═══ Phase 2：离线分析（读缓存计算）═══")
     stats = compute_ma_and_stats(raw.get("kline", []))
-    quote = raw.get("quote", {})
+    quote = raw.get("quote", {}) or {}
     flows = raw.get("flows", [])
+
+    # 行情接口偶发失败时（quote 为空），用日 K 线补齐“能算出来”的字段，
+    # 至少保证收盘/振幅/60日涨跌/YTD 不再全是 “—”。
+    quote = _enrich_quote_from_kline(quote, raw.get("kline", []))
 
     return {
         "code":    raw.get("code", DEFAULT_CODE),
@@ -558,6 +631,89 @@ def analyze_from_raw(raw: dict) -> dict:
         "signals": generate_signals(quote, stats, flows),
     }
 
+
+def _enrich_quote_from_kline(quote: dict, kline_records: list[dict]) -> dict:
+    """
+    当 quote 缺失或字段不全时，尽量从日 K 线推导补齐。
+    注意：换手率/量比/动态PE 等并非总能从 K 线拿到，缺失就保持 None。
+    """
+    if not isinstance(quote, dict):
+        quote = {}
+    if not kline_records:
+        return quote
+
+    df = pd.DataFrame(kline_records)
+    if df.empty:
+        return quote
+    df.columns = df.columns.str.strip()
+
+    # 兼容东财（中文列名）与新浪兜底（中文映射后的列名）
+    close_col = "收盘" if "收盘" in df.columns else None
+    if close_col is None:
+        # 兜底：取第 5 列（与 compute_ma_and_stats 一致），但仅在确实存在时使用
+        if df.shape[1] >= 5:
+            close_col = df.columns[4]
+        else:
+            return quote
+
+    try:
+        closes = pd.to_numeric(df[close_col], errors="coerce").dropna()
+    except Exception:
+        return quote
+    if closes.empty:
+        return quote
+
+    latest_close = float(closes.iloc[-1])
+    prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else None
+
+    # price / prev_close / change_pct：即使实时行情失败，也能从日线推出来
+    quote.setdefault("price", round(latest_close, 3))
+    if quote.get("prev_close") is None and prev_close is not None:
+        quote["prev_close"] = round(prev_close, 3)
+    if quote.get("change_pct") is None and prev_close:
+        quote["change_pct"] = round((latest_close / prev_close - 1) * 100, 3)
+
+    # 振幅：优先用已有“振幅”列，否则用（high-low）/prev_close 估算
+    if quote.get("amplitude_pct") is None:
+        if "振幅" in df.columns:
+            amp = pd.to_numeric(df["振幅"], errors="coerce").dropna()
+            if not amp.empty:
+                quote["amplitude_pct"] = round(float(amp.iloc[-1]), 3)
+        elif prev_close and ("最高" in df.columns) and ("最低" in df.columns):
+            hi = pd.to_numeric(df["最高"], errors="coerce").dropna()
+            lo = pd.to_numeric(df["最低"], errors="coerce").dropna()
+            if not hi.empty and not lo.empty:
+                quote["amplitude_pct"] = round((float(hi.iloc[-1]) - float(lo.iloc[-1])) / prev_close * 100, 3)
+
+    # 换手率：东财日线一般带“换手率”
+    if quote.get("turnover_pct") is None and "换手率" in df.columns:
+        tr = pd.to_numeric(df["换手率"], errors="coerce").dropna()
+        if not tr.empty:
+            quote["turnover_pct"] = round(float(tr.iloc[-1]), 3)
+
+    # 60 日涨跌：用收盘价推导（需要足够长度）
+    if quote.get("d60_chg") is None and len(closes) >= 60:
+        base = float(closes.iloc[-60])
+        if base:
+            quote["d60_chg"] = round((latest_close / base - 1) * 100, 3)
+
+    # 年初至今：找当年第一根日线（或最接近年初的第一根）
+    if quote.get("ytd_chg") is None and "日期" in df.columns:
+        dt = pd.to_datetime(df["日期"], errors="coerce")
+        if dt.notna().any():
+            year = int(dt.dropna().iloc[-1].year)
+            mask = (dt.dt.year == year)
+            if mask.any():
+                first_idx = mask[mask].index[0]
+                base = pd.to_numeric(df.loc[first_idx, close_col], errors="coerce")
+                try:
+                    base_f = float(base)
+                except Exception:
+                    base_f = None
+                if base_f:
+                    quote["ytd_chg"] = round((latest_close / base_f - 1) * 100, 3)
+
+    return quote
 
 # ═══════════════════════════════════════════════════════════════════
 #  输出
