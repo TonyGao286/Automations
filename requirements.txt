@@ -1,4 +1,4 @@
-akshare>=1.16.0
+akshare>=1.18.58
 pandas>=2.0.0
 tushare>=1.2.89
 requests>=2.28.0
