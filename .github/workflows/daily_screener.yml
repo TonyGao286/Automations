@@ -30,15 +30,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. 深度价值漏斗 v1（含 K 线回撤，推送结果） ──────────────
-      - name: Run deep value funnel v1
-        id: funnel_v1
-        run: python run_deep_value_funnel.py
-
-      # ── 5. 深度价值漏斗 v2（无回撤条件，推送结果） ───────────────
-      - name: Run deep value screener v2
-        id: screener_v2
-        run: python run2.py
 
       # ── 6. 太辰光每日快报（行情 + 均线 + 资金流 + 信号） ─────────
       - name: Analyze 太辰光 (300570)
